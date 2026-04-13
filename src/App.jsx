@@ -1,9 +1,15 @@
-import { useState } from "react";
+import { useState, useEffect, useCallback } from "react";
 import { BarChart, Bar, LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, ComposedChart, ReferenceLine, Cell } from "recharts";
 import LOGO from "./data/logo";
-import { MONTHS, MONTHLY, MONTHLY_EXPENSES, EXPENSE_CATEGORIES, PROJECT_CASH_IN, AR_AGING, AP_AGING } from "./data/cashflowData";
+import { MONTHS, MONTHLY as STATIC_MONTHLY, MONTHLY_EXPENSES, EXPENSE_CATEGORIES, PROJECT_CASH_IN, AR_AGING as STATIC_AR, AP_AGING as STATIC_AP } from "./data/cashflowData";
+import { fetchZohoCashflow, fetchZohoARaging, fetchZohoAPaging, fetchZohoProjects } from "./data/zohoClient";
 
 const PASSWORD = "SMCFin26";
+
+// Use static data as fallback while Zoho loads
+const MONTHLY = STATIC_MONTHLY;
+const AR_AGING_STATIC = STATIC_AR;
+const AP_AGING_STATIC = STATIC_AP;
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 const fmt  = n => { const a=Math.abs(n); const s=a>=1e6?"AED "+(a/1e6).toFixed(2)+"M":a>=1e3?"AED "+Math.round(a/1e3).toLocaleString()+"K":"AED "+Math.round(a).toLocaleString(); return n<0?"-"+s:s; };
@@ -155,7 +161,8 @@ const MonthDetail = ({idx,onClose,planIn,planOut}) => {
 };
 
 // ── AR AGING MODULE ───────────────────────────────────────────────────────────
-const ARAgingView = () => {
+const ARAgingView = ({arData}) => {
+  const AR_AGING = arData || AR_AGING_STATIC;
   const [sort,setSort]=useState("age");
   const sorted=[...AR_AGING].sort((a,b)=>sort==="age"?b.age-a.age:b.balance-a.balance);
 
@@ -291,7 +298,8 @@ const ARAgingView = () => {
 };
 
 // ── AP AGING MODULE ───────────────────────────────────────────────────────────
-const APAgingView = () => {
+const APAgingView = ({apData}) => {
+  const AP_AGING = apData || AP_AGING_STATIC;
   const [sort,setSort]=useState("age");
   const sorted=[...AP_AGING].sort((a,b)=>{
     if(sort==="age") return (b.age||0)-(a.age||0);
@@ -402,12 +410,51 @@ export default function App() {
   const [planIn,setPlanIn]     = useState(MONTHLY.map(m=>m.budgetIn));
   const [planOut,setPlanOut]   = useState(MONTHLY.map(m=>m.budgetOut));
 
+  // Zoho live data state
+  const [zohoMonthly,setZohoMonthly]   = useState(null);
+  const [zohoAR,setZohoAR]             = useState(null);
+  const [zohoAP,setZohoAP]             = useState(null);
+  const [zohoProjects,setZohoProjects] = useState(null);
+  const [zohoLoading,setZohoLoading]   = useState(false);
+  const [zohoError,setZohoError]       = useState(null);
+  const [lastSync,setLastSync]         = useState(null);
+  const [dataSource,setDataSource]     = useState("excel"); // "excel" | "zoho"
+
+  const loadZoho = useCallback(async () => {
+    setZohoLoading(true);
+    setZohoError(null);
+    try {
+      const [cf, ar, ap, proj] = await Promise.all([
+        fetchZohoCashflow("2026"),
+        fetchZohoARaging(),
+        fetchZohoAPaging(),
+        fetchZohoProjects(),
+      ]);
+      setZohoMonthly(cf.monthly);
+      if (cf.monthly) setPlanIn(cf.monthly.map(m=>m.budgetIn||m.cashIn*1.25));
+      setZohoAR(ar);
+      setZohoAP(ap);
+      setZohoProjects(proj);
+      setLastSync(new Date());
+      setDataSource("zoho");
+    } catch(e) {
+      setZohoError(e.message);
+    } finally {
+      setZohoLoading(false);
+    }
+  }, []);
+
   const uPI=(i,v)=>setPlanIn(p=>{const n=[...p];n[i]=v;return n;});
   const uPO=(i,v)=>setPlanOut(p=>{const n=[...p];n[i]=v;return n;});
 
   if(!unlocked) return <Login onUnlock={()=>setUnlocked(true)}/>;
 
-  const chartData=MONTHLY.map((m,i)=>({
+  // Use Zoho data if loaded, otherwise fall back to Excel static data
+  const ACTIVE_MONTHLY  = zohoMonthly  || MONTHLY;
+  const ACTIVE_AR       = zohoAR       || AR_AGING_STATIC;
+  const ACTIVE_AP       = zohoAP       || AP_AGING_STATIC;
+
+  const chartData=ACTIVE_MONTHLY.map((m,i)=>({
     month:MONTHS[i],
     "Actual In":Math.round(m.cashIn), "Budget In":Math.round(planIn[i]),
     "Actual Out":Math.round(m.cashOut),"Budget Out":Math.round(planOut[i]),
@@ -424,7 +471,7 @@ export default function App() {
   const projTotals=PROJECT_CASH_IN.map(p=>({...p,total2026:p.monthly.reduce((s,v)=>s+(v||0),0)})).sort((a,b)=>b.total2026-a.total2026);
 
   const tpi=planIn.reduce((s,v)=>s+v,0), tpo=planOut.reduce((s,v)=>s+v,0);
-  const tai=MONTHLY.reduce((s,m)=>s+m.cashIn,0), tao=MONTHLY.reduce((s,m)=>s+m.cashOut,0);
+  const tai=ACTIVE_MONTHLY.reduce((s,m)=>s+m.cashIn,0), tao=MONTHLY.reduce((s,m)=>s+m.cashOut,0);
   const rvp=tpi?(tai-tpi)/tpi*100:0, cvp=tpo?(tao-tpo)/tpo*100:0;
 
   const VIEWS = ["overview","plan vs actual","projects","expenses","AR aging","AP aging"];
@@ -438,8 +485,13 @@ export default function App() {
             <button key={v} onClick={()=>setView(v)} style={{background:view===v?"#0A2B2B":"none",border:"1px solid "+(view===v?"#0A2B2B":"#E5E7EB"),color:view===v?"#00FF85":"#6B7280",borderRadius:7,padding:"5px 12px",cursor:"pointer",fontSize:11,fontWeight:600,transition:"all 0.15s",fontFamily:"inherit",whiteSpace:"nowrap"}}>{v}</button>
           ))}
         </div>
-        <div style={{display:"flex",alignItems:"center",gap:10}}>
-          <span style={{fontSize:11,color:"#059669",fontWeight:600}}>● 2026</span>
+        <div style={{display:"flex",alignItems:"center",gap:8}}>
+          {zohoError&&<span style={{fontSize:11,color:"#F59E0B",fontWeight:600}} title={zohoError}>⚠ Zoho error</span>}
+          {lastSync&&<span style={{fontSize:11,color:"#9CA3AF"}}>Synced {lastSync.toLocaleTimeString([],{hour:"2-digit",minute:"2-digit"})}</span>}
+          <button onClick={loadZoho} disabled={zohoLoading} style={{background:dataSource==="zoho"?"#E1F5EE":"#F0FDF4",border:"1px solid "+(dataSource==="zoho"?"#1D9E75":"#D1FAE5"),color:dataSource==="zoho"?"#0F6E56":"#059669",borderRadius:7,padding:"5px 12px",cursor:zohoLoading?"default":"pointer",fontSize:11,fontWeight:600,fontFamily:"inherit"}}>
+            {zohoLoading?"Syncing...":dataSource==="zoho"?"⟳ Zoho Live":"⟳ Sync Zoho"}
+          </button>
+          <button onClick={()=>setDataSource("excel")} style={{background:dataSource==="excel"?"#E6F1FB":"none",border:"1px solid "+(dataSource==="excel"?"#378ADD":"#E5E7EB"),color:dataSource==="excel"?"#185FA5":"#9CA3AF",borderRadius:7,padding:"5px 10px",cursor:"pointer",fontSize:11,fontWeight:600,fontFamily:"inherit"}}>Excel</button>
           <button onClick={()=>setUnlocked(false)} style={{background:"none",border:"1px solid #E5E7EB",color:"#9CA3AF",borderRadius:7,padding:"5px 10px",cursor:"pointer",fontSize:11,fontFamily:"inherit"}}>Sign out</button>
         </div>
       </header>
@@ -449,8 +501,8 @@ export default function App() {
         {view==="overview"&&(
           <>
             <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:12,marginBottom:24}}>
-              <Kpi label="Opening Balance (Jan)" value={fmtF(MONTHLY[0].opening)}/>
-              <Kpi label="YTD Closing Balance"   value={fmtF(MONTHLY[2].net)} color="#059669" sub="Through Mar 2026"/>
+              <Kpi label="Opening Balance (Jan)" value={fmtF(ACTIVE_MONTHLY[0].opening)}/>
+              <Kpi label="YTD Closing Balance"   value={fmtF(ACTIVE_MONTHLY[2].net)} color="#059669" sub="Through Mar 2026"/>
               <Kpi label="YTD Revenue"           value={fmt(tai)} color="#1D9E75" sub={`${rvp>=0?"+":""}${rvp.toFixed(1)}% vs budget`}/>
               <Kpi label="YTD Cash Out"          value={fmt(tao)} color="#DC2626" sub={`${cvp>=0?"+":""}${cvp.toFixed(1)}% vs budget`}/>
             </div>
@@ -459,7 +511,7 @@ export default function App() {
               <Sec>Select a month to drill down</Sec>
               <div style={{display:"flex",gap:6,flexWrap:"wrap"}}>
                 {MONTHS.map((m,i)=>{
-                  const d=MONTHLY[i], hasData=d.cashIn>0||d.cashOut>0;
+                  const d=ACTIVE_MONTHLY[i], hasData=d.cashIn>0||d.cashOut>0;
                   const isPos=d.cashIn>=d.cashOut;
                   return (
                     <button key={m} onClick={()=>setActiveMonth(activeMonth===i?null:i)} style={{background:activeMonth===i?"#0A2B2B":"#fff",border:"1px solid "+(activeMonth===i?"#0A2B2B":"#E5E7EB"),color:activeMonth===i?"#00FF85":hasData?"#374151":"#D1D5DB",borderRadius:24,padding:"6px 16px",cursor:"pointer",fontSize:12,fontWeight:600,transition:"all 0.15s",position:"relative",fontFamily:"inherit"}}>
@@ -553,7 +605,7 @@ export default function App() {
             <div style={{background:"#fff",border:"1px solid #E5E7EB",borderRadius:14,padding:"20px 24px",marginBottom:20}}>
               <Sec>Revenue variance — actual vs budget</Sec>
               <ResponsiveContainer width="100%" height={190}>
-                <BarChart data={MONTHLY.map((m,i)=>({month:MONTHS[i],Variance:Math.round(m.cashIn-(planIn[i]||0))}))}>
+                <BarChart data={ACTIVE_MONTHLY.map((m,i)=>({month:MONTHS[i],Variance:Math.round(m.cashIn-(planIn[i]||0))}))}>
                   <CartesianGrid strokeDasharray="3 3" stroke="#F3F4F6"/>
                   <XAxis dataKey="month" tick={{fill:"#9CA3AF",fontSize:11}} axisLine={false} tickLine={false}/>
                   <YAxis tick={{fill:"#9CA3AF",fontSize:11}} tickFormatter={v=>(v>=0?"+":"")+fmt(v)} axisLine={false} tickLine={false}/>
@@ -582,7 +634,7 @@ export default function App() {
                   </tr>
                 </thead>
                 <tbody>
-                  {MONTHLY.map((m,i)=>{
+                  {ACTIVE_MONTHLY.map((m,i)=>{
                     const pi=planIn[i]||0,ai=m.cashIn,po=planOut[i]||0,ao=m.cashOut;
                     const vi=ai-pi,vip=pi?(vi/pi*100):0,vo=ao-po,vop=po?(vo/po*100):0;
                     const np=pi-po,na=ai-ao,nvp=np?((na-np)/Math.abs(np)*100):0;
@@ -680,7 +732,7 @@ export default function App() {
               <div style={{background:"#fff",border:"1px solid #E5E7EB",borderRadius:14,padding:"20px 24px"}}>
                 <Sec>Monthly cash out vs budget</Sec>
                 <ResponsiveContainer width="100%" height={300}>
-                  <BarChart data={MONTHLY.map((m,i)=>({month:MONTHS[i],"Actual Out":Math.round(m.cashOut),"Budget Out":Math.round(planOut[i])}))}>
+                  <BarChart data={ACTIVE_MONTHLY.map((m,i)=>({month:MONTHS[i],"Actual Out":Math.round(m.cashOut),"Budget Out":Math.round(planOut[i])}))}>
                     <CartesianGrid strokeDasharray="3 3" stroke="#F3F4F6"/>
                     <XAxis dataKey="month" tick={{fill:"#9CA3AF",fontSize:11}} axisLine={false} tickLine={false}/>
                     <YAxis tick={{fill:"#9CA3AF",fontSize:11}} tickFormatter={fmt} axisLine={false} tickLine={false}/>
@@ -717,8 +769,8 @@ export default function App() {
           </>
         )}
 
-        {view==="AR aging"&&<ARAgingView/>}
-        {view==="AP aging"&&<APAgingView/>}
+        {view==="AR aging"&&<ARAgingView arData={ACTIVE_AR}/>}
+        {view==="AP aging"&&<APAgingView apData={ACTIVE_AP}/>}
 
       </main>
 
